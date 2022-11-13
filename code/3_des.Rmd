@@ -1,0 +1,263 @@
+---
+title: "Intubation TMLE"
+author: "Tarragona Datathon"
+date: '2022-11-11'
+output: rmarkdown::pdf_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Load packages and import data}
+
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+# library(dagitty)
+# library(ggdag)
+library(data.table)
+# install.packages("remotes")
+#install.packages("lifecycle")
+#install.packages("Rsolnp")
+#install.packages("speedglm")
+# remotes::install_github("tlverse/tmle3")
+# remotes::install_github("tlverse/tmle3mediate")
+library(tmle3mediate)
+library(tmle3)
+library(sl3)
+library(speedglm)
+library(Rsolnp)
+library(lifecycle)
+
+
+```
+
+# Import Cleaned Data
+```{r}
+#tinytex::install_tinytex()
+
+# Load data
+cleaned_data <- read_csv("Tab1 H3.csv")
+
+```
+
+# Create Variables
+Note processing and basic outcomes conducted in Python
+```{r Process data}
+
+cleaned_data$sex_male <- as.numeric(cleaned_data$patientsex == 'M')
+cleaned_data$outcome <- as.numeric(cleaned_data$hospital_outcome == "EXITUS")
+
+# Create working dataset
+ObsData <-subset(cleaned_data, select=c(age,sex_male,bmi,
+                                        sofa.max,sofa.avg,
+                                        outcome
+                                        ))
+ObsData <- na.omit(ObsData) 
+sapply(ObsData, class)
+
+head(ObsData,n=2)
+
+```
+
+# The Logic of Early Warning Scores 
+Early warning scores use patient observations to trigger a review by clinicians if they reach a certain threshold
+Appropriate triggering will allow for early review before significant deterioration, allowing for starting of relevant treatment, and hopefully better outcomes
+
+```{r}
+
+dagify(
+  Obs ~ Patient,
+  Trigger ~ Obs,
+  Review ~ Trigger,
+  Treatment ~ Review,
+  Improve ~ Treatment,
+  Deteriorate ~ Treatment
+) %>%
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point(size=20) +
+  geom_dag_edges(linemitre=2) +
+  geom_dag_text(size=3)+
+  theme_dag()
+
+
+```
+# Failure to Trigger Review
+Differences in Pulse oximter performance has been shown between ethnicities, due to failure in infrared technology to be calibrated apropriately to differnt skin tones
+
+This device is used in Early Warning Scores to and therefore could result in delayed review and treatment
+This could result in worse patient outcomes in these groups
+
+```{r}
+
+dagify(
+  Trigger ~ Obs,
+  Outcome ~ Trigger,
+  Obs ~ Oximeter,
+  Trigger ~ Oximeter
+) %>%
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point(size=20) +
+  geom_dag_edges(linemitre=2) +
+  geom_dag_text(size=3)+
+  theme_dag()
+
+```
+
+We therefore investigated the effects of pulse oximetry variable performance on different ethncities
+Relating this to the TMLE structure this looks like...
+
+```{r}
+
+dagify(
+  Patient ~ Age + Sex + PMH + Ethnicity,
+  Obs ~ Patient,
+  Outcome ~ Trigger,
+  Trigger ~ Obs,
+  Oximeter ~ Ethnicity,
+  Trigger ~ Obs,
+  Trigger ~ Oximeter
+) %>%
+  ggplot(aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point(size=20) +
+  geom_dag_edges(linemitre=2) +
+  geom_dag_text(size=3)+
+  theme_dag()
+
+```
+
+
+# Prepare the variables 
+Y: Primary outcome event (1 outcome, 0 no outcome), this includes any of the following:
+  ALIVE
+  EXITUS
+  
+A: ("Treatment") -> SEX
+
+Z: The mediating factor (patients' SOFA max score)
+
+(W: comorbidilities)
+W1: Age (Currently floating number)
+    Could change to categorical ie over under 65
+
+W2: BMI 
+
+```{r Set variables for TMLE}
+
+# Outcome
+Y  <- "outcome"
+
+# Treatment
+A  <- "sex_male"
+
+# Mediators
+Z = "sofa.max"
+
+# Covariates
+W= c("bmi","age")
+
+node_list <- list(
+  W = W,
+  A = A,
+  Z = Z,
+  Y = Y
+)
+
+```
+
+```{r}
+summary(glm(outcome ~ sex_male + sofa.max + bmi + age,ObsData, family=gaussian(link="identity")))
+```
+
+
+# Ensemble Learner
+Construct an ensemble learner using a handful of popular machine learning algorithms
+
+```{r}
+# SL learners used for continuous data (the nuisance parameter Z)
+enet_contin_learner <- Lrnr_glmnet$new(
+  alpha = 0.5, family = "gaussian", nfolds = 3
+)
+lasso_contin_learner <- Lrnr_glmnet$new(
+  alpha = 1, family = "gaussian", nfolds = 3
+)
+fglm_contin_learner <- Lrnr_glm_fast$new(family = gaussian())
+mean_learner <- Lrnr_mean$new()
+contin_learner_lib <- Stack$new(
+  enet_contin_learner, lasso_contin_learner, fglm_contin_learner, mean_learner
+)
+sl_contin_learner <- Lrnr_sl$new(learners = contin_learner_lib)
+
+# SL learners used for binary data (nuisance parameters G and E in this case)
+enet_binary_learner <- Lrnr_glmnet$new(
+  alpha = 0.5, family = "binomial", nfolds = 3
+)
+lasso_binary_learner <- Lrnr_glmnet$new(
+  alpha = 1, family = "binomial", nfolds = 3
+)
+fglm_binary_learner <- Lrnr_glm_fast$new(family = binomial())
+binary_learner_lib <- Stack$new(
+  enet_binary_learner, lasso_binary_learner, fglm_binary_learner, mean_learner
+)
+sl_binary_learner <- Lrnr_sl$new(learners = binary_learner_lib)
+
+# create list for treatment and outcome mechanism regressions
+learner_list <- list(
+  Y = sl_contin_learner,
+  A = sl_binary_learner
+)
+
+```
+
+
+# Targeted Estimation of the Natural Indirect Effect
+
+```{r}
+require(methods)
+
+tmle_spec_NIE <- tmle_NIE(
+  e_learners = Lrnr_cv$new(lasso_binary_learner, full_fit = TRUE),
+  psi_Z_learners = Lrnr_cv$new(lasso_contin_learner, full_fit = TRUE),
+  max_iter = 1
+)
+ObsData_NIE <- tmle3(
+  tmle_spec_NIE, ObsData, node_list, learner_list
+)
+ObsData_NIE
+
+```
+Based on the output, we see that the indirect effect of the treatment through the mediators (sex male) is 0.008197 - IMV cohort
+Based on the output, we see that the indirect effect of the treatment through the mediators (sex male) in all patients H3 is 0.01737
+
+# Targeted Estimation of the Natural Direct Effect
+
+``` {r}
+tmle_spec_NDE <- tmle_NDE(
+  e_learners = Lrnr_cv$new(lasso_binary_learner, full_fit = TRUE),
+  psi_Z_learners = Lrnr_cv$new(lasso_contin_learner, full_fit = TRUE),
+  max_iter = 1
+)
+ObsData_NDE <- tmle3(
+  tmle_spec_NDE, ObsData, node_list, learner_list
+)
+ObsData_NDE
+
+```
+
+From this, we can draw the conclusion that the direct effect of the treatment (through all paths not involving the mediators (ethnicity)) is 0.09847
+
+Together, the estimates of the natural direct and indirect effects approximately recover the average treatment effect, that is, based on these estimates of the NDE and NIE, the ATE is roughly .
+
+
+
+
+
+## References
+https://tlverse.org/tlverse-handbook/causal-mediation-analysis.html
+https://migariane.github.io/TMLE.nb.html
